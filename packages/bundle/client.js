@@ -832,12 +832,51 @@ a.dsh-wechat-button { text-decoration: none; }
       }
 
     /**
+     * Read a client service this plugin deliberately does not declare through `inject`.
+     *
+     * `ctx.uiWorkspace` is a *property read* on cordis's context proxy, and that proxy throws
+     * `cannot get property "uiWorkspace" without inject` for every service the plugin did not
+     * declare — optional chaining does not save it, because `ctx` itself is never null and the
+     * getter is what throws. That is the whole of the browser-side report `打开文件夹选择器失败:
+     * cannot get property "uiWorkspace" without inject`: nothing was wrong with the picker, the
+     * page never reached it.
+     *
+     * Declaring it in `inject` is the other way out, and the wrong one here. An injected service is
+     * a hard requirement of activation — cordis holds the plugin back until it is provided, and
+     * refuses to start it at all when it never is — while the workspace service may legitimately
+     * arrive after this plugin does, and a client that offers no picker at all must still get a
+     * working settings page. `ctx.get` is cordis's own answer to that: it reads from the service
+     * store *without* the inject requirement and answers `undefined` when nothing provides the
+     * name, which is exactly the fallback this call site wants.
+     *
+     * The direct read stays as the second route so a bare stub context — a plain object, as the
+     * page's own tests hand `apply` — keeps working.
+     *
+     * @param {object} ctx - Client plugin context.
+     * @param {string} name - Service name.
+     * @returns {unknown} The service, or undefined when this client does not provide it.
+     */
+    function clientService(ctx, name) {
+      if (ctx === undefined || ctx === null) return undefined
+      if (typeof ctx.get === 'function') return ctx.get(name)
+      try {
+        return ctx[name]
+      } catch {
+        return undefined
+      }
+    }
+
+    /**
      * Open DSH's own folder dialog.
      *
      * Two routes, because the desktop app and the web client expose it differently: the Electron
      * preload publishes `__DSH_DIRECTORY_PICKER__`, and everything else goes through the workspace
      * service. Both are tried in that order, which is the order the shell's own directory-picker
      * plugin uses.
+     *
+     * The workspace service is read through {@link clientService}, never as `ctx.uiWorkspace`: the
+     * property read is what cordis rejects outright on a client that did not inject the name, and
+     * the throw happens before the picker is ever called.
      *
      * Nothing is caught here, deliberately. The desktop side guards this call — it accepts only a
      * request from the app's own main frame, and a request from anywhere else is *thrown*, not
@@ -856,7 +895,7 @@ a.dsh-wechat-button { text-decoration: none; }
       if (desktop !== undefined && typeof desktop.pick === 'function') {
         return (await desktop.pick()) ?? undefined
       }
-      const workspace = ctx?.uiWorkspace
+      const workspace = clientService(ctx, 'uiWorkspace')
       if (workspace !== undefined && typeof workspace.pickDirectory === 'function') {
         return (await workspace.pickDirectory()) ?? undefined
       }

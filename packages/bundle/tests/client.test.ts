@@ -325,8 +325,18 @@ async function mountPage(routes, options = {}) {
      * It is the fallback route to the folder dialog, and reaching it is the only proof that the
      * page kept the context `apply` was given: a component cannot see that argument on its own, and
      * naming it anyway is a `ReferenceError` thrown before the picker is called.
+     *
+     * This is the *stub* shape of a context — a plain object, where the service is a property. A
+     * test that wants the shape cordis actually hands over asks for `options.cordis` instead; see
+     * below.
      */
     ...(options.uiWorkspace === undefined ? {} : { uiWorkspace: options.uiWorkspace }),
+    /*
+     * The cordis route to a service: `get(name)`, which in the real context reads from the service
+     * store without the `inject` requirement. Present only under `options.cordis`, so the plain
+     * stub above keeps exercising the property-read route on its own.
+     */
+    ...(options.cordis === undefined ? {} : { get: (name) => options.cordis.services[name] }),
     // The client-plugin rules require resources to be registered through `effect`,
     // so the stub runs the body and collects the returned cleaner.
     effect(execute) {
@@ -343,7 +353,29 @@ async function mountPage(routes, options = {}) {
       },
     },
   }
-  bundle.exports.apply(ctx)
+  /*
+   * `options.cordis` makes the stub behave the way the context proxy does on the real page: a
+   * service the plugin did not declare through `inject` throws when read as a property, and is
+   * reachable only through `get`.
+   *
+   * This is the reported failure, exactly: on a browser there is no `__DSH_DIRECTORY_PICKER__`, so
+   * 「选择文件夹」 fell through to `ctx.uiWorkspace`, the proxy threw
+   * `cannot get property "uiWorkspace" without inject`, and the page showed it as
+   * `打开文件夹选择器失败: cannot get property "uiWorkspace" without inject`. Optional chaining was
+   * never going to help — `ctx` is not null, the getter is what throws.
+   */
+  bundle.exports.apply(
+    options.cordis === undefined
+      ? ctx
+      : new Proxy(ctx, {
+          get(target, prop, receiver) {
+            if (typeof prop !== 'symbol' && !Reflect.has(target, prop)) {
+              throw new Error(`cannot get property "${String(prop)}" without inject`)
+            }
+            return Reflect.get(target, prop, receiver)
+          },
+        }),
+  )
   assert.equal(sections.length, 1, 'apply must register one settings section')
 
   const component = sections[0].component
@@ -1062,6 +1094,60 @@ test('the folder dialog is reached through the workspace service when the deskto
     const field = collectByType(tree, 'input').find((node) => node.props.type === 'text')
     assert.equal(field.props.value, 'C:\\from-workspace', 'the service route fills the field')
     assert.doesNotMatch(collectText(tree).join(' | '), /打开文件夹选择器失败/, 'and nothing failed')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('the folder dialog is reached through cordis get(), where reading the service as a property throws', async () => {
+  /*
+   * The browser report, in the shape it arrived in: `打开文件夹选择器失败: cannot get property
+   * "uiWorkspace" without inject`.
+   *
+   * The page used to read `ctx?.uiWorkspace`. On the real page `ctx` is cordis's context proxy,
+   * which throws for every service the plugin did not declare through `inject`, so the fallback
+   * never ran and the user got a message about internals instead of a dialog. `ctx.get` is the
+   * read that does not require the inject declaration, and this is the test that holds the page to
+   * it — a plain stub context (the test above) cannot, because nothing on a plain object throws.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)), {
+    cordis: { services: { uiWorkspace: { pickDirectory: async () => 'C:\\from-cordis' } } },
+  })
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    const field = collectByType(tree, 'input').find((node) => node.props.type === 'text')
+    assert.equal(field.props.value, 'C:\\from-cordis', 'the service route fills the field')
+    assert.doesNotMatch(
+      collectText(tree).join(' | '),
+      /without inject/,
+      'and the page never reports the inject guard to the user',
+    )
+    assert.doesNotMatch(collectText(tree).join(' | '), /打开文件夹选择器失败/, 'and nothing failed')
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('a client with no picker at all still says so, rather than looking like a cancelled dialog', async () => {
+  /*
+   * The other half of the contract: a context that offers nothing must produce the page's own
+   * message. Without this, a fix that quietly swallowed the missing service would leave the button
+   * doing nothing at all — the failure mode the page was written to avoid.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)), {
+    cordis: { services: {} },
+  })
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const tree = await settle(page)
+
+    assert.match(
+      collectText(tree).join(' | '),
+      /no directory picker is available in this client/,
+      'the page reports the missing picker itself',
+    )
   } finally {
     page.bundle.restore()
   }
