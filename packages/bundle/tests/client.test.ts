@@ -203,10 +203,21 @@ async function loadClientBundle(options = {}) {
     }),
   }
 
+  /*
+   * Window subscriptions are captured, not dropped: the page reloads its settings when the window
+   * regains focus, and that reload is what the folder dialog provokes — opening the dialog blurs
+   * the window, closing it focuses the window again. A stub that swallowed the handler could not
+   * tell a page that survives that from one that quietly loses what the user just picked.
+   */
+  const windowListeners = new Map<string, () => void>()
   globalThis.window = {
     __ModuleLoader__: { load: (registration) => registrations.push(registration) },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(type, handler) {
+      windowListeners.set(type, handler)
+    },
+    removeEventListener(type, handler) {
+      if (windowListeners.get(type) === handler) windowListeners.delete(type)
+    },
   }
   globalThis.document = documentStub
   // Timers are neutralised: the poll loop is not what these tests exercise.
@@ -267,6 +278,20 @@ async function loadClientBundle(options = {}) {
       assert.equal(watchdogTimers.length, 1, 'the watchdog must be armed exactly once, at load time')
       const [timer] = watchdogTimers.splice(0)
       timer()
+    },
+    /**
+     * Fire a window event the page subscribed to.
+     *
+     * Only `focus` matters here, and it is the one event the page's own dialogs cause: the folder
+     * dialog blurs the window while it is open and focuses it again when it closes, so every pick
+     * is followed by a reload. A test that cannot fire it cannot see that reload.
+     *
+     * @param type - Event name the page listens for.
+     */
+    fireWindowEvent(type) {
+      const handler = windowListeners.get(type)
+      assert.ok(handler, `the page must subscribe to window ${type}`)
+      handler()
     },
     restore() {
       for (const [key, value] of Object.entries(saved)) {
@@ -1148,6 +1173,77 @@ test('a client with no picker at all still says so, rather than looking like a c
       /no directory picker is available in this client/,
       'the page reports the missing picker itself',
     )
+  } finally {
+    page.bundle.restore()
+  }
+})
+
+test('a picked folder survives the reload the dialog itself provokes', async () => {
+  /*
+   * The reported failure, in order: 「弹出了对话框，我选择了目录，输入框有内容，但是保存设置后输入框就没有内容了」.
+   *
+   * The folder dialog blurs the window while it is open and focuses it again when it closes, and
+   * this page reloads its settings on `focus`. That reload rebuilt the draft from the *stored*
+   * settings, so the directory the dialog had just returned was erased a moment after it appeared —
+   * and 「保存设置」 then posted the stored settings, which the host recorded as
+   * `workspacePath "" -> ""`. Nothing reported a failure anywhere, because nothing failed: the page
+   * threw the value away and then honestly saved what was left.
+   *
+   * Every step is asserted, because the symptom was invisible from every other angle: the box, the
+   * note beside it, and the body the save actually carries.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  const undo = withDirectoryPicker(async () => 'C:\\picked-ws')
+  try {
+    findButton(page.tree, '选择文件夹').props.onClick()
+    const picked = await settle(page)
+    const field = () => collectByType(picked, 'input').find((node) => node.props.type === 'text')
+    assert.equal(field().props.value, 'C:\\picked-ws', 'the dialog fills the box')
+
+    page.bundle.fireWindowEvent('focus')
+    const reloaded = await settle(page)
+    const afterReload = collectByType(reloaded, 'input').find((node) => node.props.type === 'text')
+    assert.equal(
+      afterReload.props.value,
+      'C:\\picked-ws',
+      'and the reload the dialog provoked must not empty it',
+    )
+    assert.match(
+      collectText(reloaded).join(' | '),
+      /有改动还没保存/,
+      'the page still says the picked directory is not saved yet',
+    )
+
+    findButton(reloaded, '保存设置').props.onClick()
+    await settle(page)
+    const post = page.calls.find((call) => call.method === 'POST' && call.path === PREFIX + '/settings')
+    assert.ok(post, 'the save has to reach the host')
+    assert.equal(
+      JSON.parse(post.body).workspacePath,
+      'C:\\picked-ws',
+      'the picked directory is what gets posted, not the stored empty one',
+    )
+  } finally {
+    undo()
+    page.bundle.restore()
+  }
+})
+
+test('a reload still brings in a value that changed elsewhere', async () => {
+  /*
+   * The other half of the contract: keeping the user's own edits must not freeze the page against
+   * the host. A key nobody edited locally is still replaced by whatever the reload returned.
+   */
+  const page = await mountPage(pageRoutes(settingsRoute(SETTINGS)))
+  try {
+    const before = collectByType(page.tree, 'input').find((node) => node.props.type === 'text')
+    assert.equal(before.props.value, '', 'nothing stored yet')
+
+    page.bundle.fireWindowEvent('focus')
+    const reloaded = await settle(page)
+    const after = collectByType(reloaded, 'input').find((node) => node.props.type === 'text')
+    assert.equal(after.props.value, '', 'an untouched field still shows what is stored')
+    assert.doesNotMatch(collectText(reloaded).join(' | '), /有改动还没保存/, 'and nothing is pending')
   } finally {
     page.bundle.restore()
   }

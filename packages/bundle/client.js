@@ -626,20 +626,36 @@ a.dsh-wechat-button { text-decoration: none; }
           // Status is the one the page cannot do without, so its failure is still fatal.
           if (status === undefined) throw new Error('status unavailable')
 
-          setState((prev) => ({
-            ...prev,
-            phase: 'ready',
-            error: '',
-            status,
-            login: login ?? prev.login,
-            settings: settings?.settings,
-            defaults: settings?.defaults,
-            // A reload discards an in-progress edit, which is the honest behaviour: what is shown
-            // is what is stored. The notes about that edit go with it, for the same reason.
-            draft: settings?.settings ?? prev.draft,
-            picked: false,
-            pickError: '',
-          }))
+          setState((prev) => {
+            const draft = draftAfterReload(prev.draft, prev.settings, settings?.settings)
+            /*
+             * A reload is only a reset when there was nothing to lose.
+             *
+             * The draft used to be replaced wholesale, so an unsaved edit died on every `focus` —
+             * and the folder dialog guarantees one: opening it takes focus from the window, closing
+             * it hands focus back, and the handler below reloads. Picking a directory therefore
+             * filled the box and the reload it had itself provoked emptied it, which is how a
+             * picked workspace came to be posted as the stored empty one.
+             *
+             * What survives is an edit, and the page already says so in its own words
+             * (「有改动还没保存」), so keeping it is visible rather than silent. What does not
+             * survive — a note about an edit that is no longer pending — goes, because a note that
+             * outlives what it describes is the same lie in the other direction.
+             */
+            const pending = draft !== undefined && changedKeys(draft, settings?.settings ?? {}).length > 0
+            return {
+              ...prev,
+              phase: 'ready',
+              error: '',
+              status,
+              login: login ?? prev.login,
+              settings: settings?.settings,
+              defaults: settings?.defaults,
+              draft,
+              picked: pending ? prev.picked : false,
+              pickError: pending ? prev.pickError : '',
+            }
+          })
         } catch (error) {
           reportFailure('load', error)
           setState((prev) => ({
@@ -922,6 +938,34 @@ a.dsh-wechat-button { text-decoration: none; }
       }
       if (typeof sent === 'string' && typeof stored === 'string') return sent.trim() === stored.trim()
       return sent === stored
+    }
+
+    /**
+     * The draft a reload leaves behind: what is stored, plus every edit the user has not saved.
+     *
+     * A reload used to replace the draft wholesale, on the reasoning that what is shown should be
+     * what is stored. That is right for a value the host changed elsewhere, and wrong for one the
+     * user is still holding — the difference the folder dialog made visible, because it takes focus
+     * from the window and closing it gives focus back to a page whose `focus` handler reloads.
+     *
+     * The observed failure, end to end: pick a directory → the box fills → the dialog's own focus
+     * event reloads → the box empties → 「保存设置」 posts the settings that are stored, the host
+     * logs `workspacePath "" -> ""`, and the setting is silently never saved. A half-typed note
+     * went the same way, for the same reason and without the dialog.
+     *
+     * @param {object} draft - The draft as it stood before the reload.
+     * @param {object} storedBefore - The settings that were stored before the reload.
+     * @param {object} stored - The settings the host just answered with.
+     * @returns {object} The draft to show.
+     */
+    function draftAfterReload(draft, storedBefore, stored) {
+      const base = stored ?? draft
+      if (draft === undefined || storedBefore === undefined || stored === undefined) return base
+      const merged = { ...base }
+      // Keys the user changed, carried over. A key only the host changed is not in this list, so
+      // the reload still brings in whatever changed elsewhere.
+      for (const key of changedKeys(draft, storedBefore)) merged[key] = draft[key]
+      return merged
     }
 
     /**
